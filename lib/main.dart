@@ -1,7 +1,13 @@
 // Proyecto app_miel · lib/main.dart
 // Antes: flutter pub add supabase_flutter
+import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+
+/// Alias para no escribir List<Map<String, dynamic>> en todos lados
+/// (y evitar que se pierdan los < > al copiar y pegar).
+typedef Filas = List<Map<String, dynamic>>;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -27,28 +33,32 @@ void aviso(BuildContext c, String m) =>
     ScaffoldMessenger.of(c).showSnackBar(SnackBar(content: Text(m)));
 
 String fmt(Object? n) {
-  final v = (n ?? 0) as num;
+  final v = n is num ? n : (num.tryParse('${n ?? 0}') ?? 0);
   return v == v.roundToDouble() ? v.toInt().toString() : v.toString();
 }
 
 String msgError(Object e) {
   if (e is PostgrestException) {
-    if (e.code == '23514') return 'Existencia insuficiente';
+    if (e.code == '23514') return 'Existencia insuficiente o formato inválido';
     if (e.code == '23503') {
       return 'No se puede eliminar: tiene movimientos, lotes o recetas asociados';
+    }
+    if (e.code == '23505') {
+      return 'Ya existe un registro con esa Clave UPP o Clave RASMIEL';
     }
     return e.message;
   }
   return 'Error: $e';
 }
 
-Stream<List<Map<String, dynamic>>> flujo(String t) =>
+Stream<Filas> flujo(String t) =>
     db.from(t).stream(primaryKey: ['id']).order('nombre');
 
 Widget titulo(String t) => Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
       child: Text(t,
-          style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: cafe)),
+          style: const TextStyle(
+              fontSize: 20, fontWeight: FontWeight.bold, color: cafe)),
     );
 
 class ApiculturaApp extends StatelessWidget {
@@ -63,12 +73,15 @@ class ApiculturaApp extends StatelessWidget {
           useMaterial3: true,
           scaffoldBackgroundColor: const Color(0xFFF9F6F0),
           appBarTheme: const AppBarTheme(
-              backgroundColor: Color(0xFFE5A912), foregroundColor: Colors.white, elevation: 0),
+              backgroundColor: Color(0xFFE5A912),
+              foregroundColor: Colors.white,
+              elevation: 0),
         ),
         home: StreamBuilder<AuthState>(
           stream: db.auth.onAuthStateChange,
-          builder: (ctx, snap) =>
-              db.auth.currentSession == null ? const LoginScreen() : const HomeScreen(),
+          builder: (ctx, snap) => db.auth.currentSession == null
+              ? const LoginScreen()
+              : const HomeScreen(),
         ),
       );
 }
@@ -84,10 +97,18 @@ class _LoginScreenState extends State<LoginScreen> {
   final email = TextEditingController(), pass = TextEditingController();
   bool cargando = false;
 
+  @override
+  void dispose() {
+    email.dispose();
+    pass.dispose();
+    super.dispose();
+  }
+
   Future<void> entrar() async {
     setState(() => cargando = true);
     try {
-      await db.auth.signInWithPassword(email: email.text.trim(), password: pass.text);
+      await db.auth
+          .signInWithPassword(email: email.text.trim(), password: pass.text);
     } on AuthException {
       if (mounted) aviso(context, 'Correo o contraseña incorrectos');
     }
@@ -104,7 +125,10 @@ class _LoginScreenState extends State<LoginScreen> {
               child: Column(mainAxisSize: MainAxisSize.min, children: [
                 const Text('🐝', style: TextStyle(fontSize: 64)),
                 const Text('Gestión Apícola',
-                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: cafe)),
+                    style: TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.bold,
+                        color: cafe)),
                 const SizedBox(height: 16),
                 TextField(
                     controller: email,
@@ -142,6 +166,7 @@ class _HomeScreenState extends State<HomeScreen> {
     InventarioScreen(),
     TrazabilidadScreen(),
     ProduccionScreen(),
+    ProveedoresScreen(),
   ];
 
   @override
@@ -157,14 +182,20 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         body: _pages[_currentIndex],
         bottomNavigationBar: BottomNavigationBar(
+          type: BottomNavigationBarType.fixed,
           currentIndex: _currentIndex,
           selectedItemColor: ambar,
           unselectedItemColor: Colors.grey,
           onTap: (i) => setState(() => _currentIndex = i),
           items: const [
-            BottomNavigationBarItem(icon: Icon(Icons.inventory_2), label: 'Inventario'),
-            BottomNavigationBarItem(icon: Icon(Icons.qr_code_scanner), label: 'Trazabilidad'),
-            BottomNavigationBarItem(icon: Icon(Icons.analytics), label: 'Producción'),
+            BottomNavigationBarItem(
+                icon: Icon(Icons.inventory_2), label: 'Inventario'),
+            BottomNavigationBarItem(
+                icon: Icon(Icons.qr_code_scanner), label: 'Trazabilidad'),
+            BottomNavigationBarItem(
+                icon: Icon(Icons.analytics), label: 'Producción'),
+            BottomNavigationBarItem(
+                icon: Icon(Icons.agriculture), label: 'Proveedores'),
           ],
         ),
       );
@@ -196,7 +227,9 @@ class _InventarioScreenState extends State<InventarioScreen> {
         if (c == null) {
           await db.from('categorias').insert({'nombre': f['nombre']});
         } else {
-          await db.from('categorias').update({'nombre': f['nombre']}).eq('id', c['id']);
+          await db
+              .from('categorias')
+              .update({'nombre': f['nombre']}).eq('id', c['id']);
         }
       }
     } catch (e) {
@@ -205,30 +238,37 @@ class _InventarioScreenState extends State<InventarioScreen> {
   }
 
   @override
-  Widget build(BuildContext context) => StreamBuilder<List<Map<String, dynamic>>>(
+  Widget build(BuildContext context) => StreamBuilder<Filas>(
         stream: flujo('categorias'),
         builder: (ctx, sc) {
-          final cats = sc.data ?? [];
-          return StreamBuilder<List<Map<String, dynamic>>>(
+          final cats = sc.data ?? <Map<String, dynamic>>[];
+          return StreamBuilder<Filas>(
             stream: flujo('insumos'),
             builder: (ctx, si) {
-              if (!si.hasData) return const Center(child: CircularProgressIndicator());
-              final items =
-                  si.data!.where((x) => cat == null || x['categoria_id'] == cat).toList();
+              if (!si.hasData) {
+                return const Center(child: CircularProgressIndicator());
+              }
+              final items = si.data!
+                  .where((x) => cat == null || x['categoria_id'] == cat)
+                  .toList();
               return Scaffold(
                 backgroundColor: Colors.transparent,
                 floatingActionButton: FloatingActionButton.extended(
                     backgroundColor: ambar,
                     onPressed: () => editarInsumo(context, cats, cat),
                     icon: const Icon(Icons.add, color: Colors.white),
-                    label: const Text('Insumo', style: TextStyle(color: Colors.white))),
+                    label: const Text('Insumo',
+                        style: TextStyle(color: Colors.white))),
                 body: Column(children: [
-                  Align(alignment: Alignment.centerLeft, child: titulo('Inventario de Insumos y Materiales')),
+                  Align(
+                      alignment: Alignment.centerLeft,
+                      child: titulo('Inventario de Insumos y Materiales')),
                   SizedBox(
                     height: 56,
                     child: ListView(
                       scrollDirection: Axis.horizontal,
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 8),
                       children: [
                         Padding(
                           padding: const EdgeInsets.only(right: 8),
@@ -245,7 +285,8 @@ class _InventarioScreenState extends State<InventarioScreen> {
                               child: ChoiceChip(
                                   label: Text(c['nombre']),
                                   selected: cat == c['id'],
-                                  onSelected: (_) => setState(() => cat = c['id'])),
+                                  onSelected: (_) =>
+                                      setState(() => cat = c['id'])),
                             ),
                           ),
                         ActionChip(
@@ -257,11 +298,14 @@ class _InventarioScreenState extends State<InventarioScreen> {
                   ),
                   Expanded(
                     child: items.isEmpty
-                        ? const Center(child: Text('Sin insumos. Crea una categoría y agrega el primero.'))
+                        ? const Center(
+                            child: Text(
+                                'Sin insumos. Crea una categoría y agrega el primero.'))
                         : ListView.builder(
                             padding: const EdgeInsets.fromLTRB(12, 0, 12, 90),
                             itemCount: items.length,
-                            itemBuilder: (_, k) => tarjetaInsumo(ctx, items[k], cats),
+                            itemBuilder: (_, k) =>
+                                tarjetaInsumo(ctx, items[k], cats),
                           ),
                   ),
                 ]),
@@ -271,7 +315,7 @@ class _InventarioScreenState extends State<InventarioScreen> {
         },
       );
 
-  Widget tarjetaInsumo(BuildContext c, Map<String, dynamic> it, List<Map<String, dynamic>> cats) {
+  Widget tarjetaInsumo(BuildContext c, Map<String, dynamic> it, Filas cats) {
     final min = (it['stock_minimo'] ?? 0) as num;
     final bajo = min > 0 && (it['existencia'] as num) <= min;
     final desc = (it['descripcion'] ?? '') as String;
@@ -284,7 +328,8 @@ class _InventarioScreenState extends State<InventarioScreen> {
           Row(children: [
             Expanded(
                 child: Text(it['nombre'],
-                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16))),
+                    style: const TextStyle(
+                        fontWeight: FontWeight.bold, fontSize: 16))),
             if (bajo) const Icon(Icons.warning_amber, color: Colors.orange),
             PopupMenuButton<String>(
               onSelected: (v) => v == 'e'
@@ -296,11 +341,15 @@ class _InventarioScreenState extends State<InventarioScreen> {
               ],
             ),
           ]),
-          if (desc.isNotEmpty) Text(desc, style: const TextStyle(color: Colors.black54)),
+          if (desc.isNotEmpty)
+            Text(desc, style: const TextStyle(color: Colors.black54)),
           Text('${fmt(it['existencia'])} ${it['unidad']}',
               style: TextStyle(
-                  fontSize: 26, fontWeight: FontWeight.bold, color: bajo ? Colors.red : ambar)),
-          if (min > 0) Text('Mínimo: ${fmt(min)}${bajo ? '  ·  ¡Por agotarse!' : ''}'),
+                  fontSize: 26,
+                  fontWeight: FontWeight.bold,
+                  color: bajo ? Colors.red : ambar)),
+          if (min > 0)
+            Text('Mínimo: ${fmt(min)}${bajo ? '  ·  ¡Por agotarse!' : ''}'),
           const SizedBox(height: 8),
           Row(children: [
             Expanded(
@@ -323,7 +372,7 @@ class _InventarioScreenState extends State<InventarioScreen> {
   }
 }
 
-Future<void> editarInsumo(BuildContext c, List<Map<String, dynamic>> cats, String? catSel,
+Future<void> editarInsumo(BuildContext c, Filas cats, String? catSel,
     [Map<String, dynamic>? it]) async {
   final n = TextEditingController(text: it?['nombre'] ?? '');
   final u = TextEditingController(text: it?['unidad'] ?? 'pza');
@@ -337,20 +386,32 @@ Future<void> editarInsumo(BuildContext c, List<Map<String, dynamic>> cats, Strin
       content: StatefulBuilder(
         builder: (_, set) => SingleChildScrollView(
           child: Column(mainAxisSize: MainAxisSize.min, children: [
-            TextField(controller: n, decoration: const InputDecoration(labelText: 'Nombre')),
-            TextField(controller: u, decoration: const InputDecoration(labelText: 'Unidad (pza, kg, lt)')),
-            TextField(controller: d, decoration: const InputDecoration(labelText: 'Descripción (opcional)')),
+            TextField(
+                controller: n,
+                decoration: const InputDecoration(labelText: 'Nombre')),
+            TextField(
+                controller: u,
+                decoration:
+                    const InputDecoration(labelText: 'Unidad (pza, kg, lt)')),
+            TextField(
+                controller: d,
+                decoration:
+                    const InputDecoration(labelText: 'Descripción (opcional)')),
             TextField(
                 controller: m,
-                keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                decoration: const InputDecoration(labelText: 'Stock mínimo (alerta)')),
+                keyboardType:
+                    const TextInputType.numberWithOptions(decimal: true),
+                decoration:
+                    const InputDecoration(labelText: 'Stock mínimo (alerta)')),
             DropdownButtonFormField<String?>(
               initialValue: cat,
               decoration: const InputDecoration(labelText: 'Categoría'),
               items: [
-                const DropdownMenuItem<String?>(value: null, child: Text('Sin categoría')),
+                const DropdownMenuItem<String?>(
+                    value: null, child: Text('Sin categoría')),
                 for (final x in cats)
-                  DropdownMenuItem<String?>(value: x['id'] as String, child: Text(x['nombre'])),
+                  DropdownMenuItem<String?>(
+                      value: x['id'] as String, child: Text(x['nombre'])),
               ],
               onChanged: (v) => set(() => cat = v),
             ),
@@ -358,17 +419,30 @@ Future<void> editarInsumo(BuildContext c, List<Map<String, dynamic>> cats, Strin
         ),
       ),
       actions: [
-        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
-        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Guardar')),
+        TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancelar')),
+        FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Guardar')),
       ],
     ),
   );
-  if (ok != true || n.text.trim().isEmpty) return;
+  final nombre = n.text.trim();
+  final unidad = u.text.trim();
+  final desc = d.text.trim();
+  final minVal = num.tryParse(m.text) ?? 0;
+  n.dispose();
+  u.dispose();
+  d.dispose();
+  m.dispose();
+
+  if (ok != true || nombre.isEmpty) return;
   final datos = {
-    'nombre': n.text.trim(),
-    'unidad': u.text.trim().isEmpty ? 'pza' : u.text.trim(),
-    'descripcion': d.text.trim().isEmpty ? null : d.text.trim(),
-    'stock_minimo': num.tryParse(m.text) ?? 0,
+    'nombre': nombre,
+    'unidad': unidad.isEmpty ? 'pza' : unidad,
+    'descripcion': desc.isEmpty ? null : desc,
+    'stock_minimo': minVal,
     'categoria_id': cat,
   };
   try {
@@ -390,32 +464,36 @@ class TrazabilidadScreen extends StatefulWidget {
 }
 
 class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
-  late Future<List<Map<String, dynamic>>> f = cargar();
+  late Future<Filas> f = cargar();
   String busqueda = '';
 
-  Future<List<Map<String, dynamic>>> cargar() => db
+  Future<Filas> cargar() => db
       .from('lotes')
       .select('*, productos(nombre, unidad)')
       .order('created_at', ascending: false);
 
   void detalle(Map<String, dynamic> l) => showModalBottomSheet(
         context: context,
-        builder: (_) => FutureBuilder<List<Map<String, dynamic>>>(
+        builder: (_) => FutureBuilder<Filas>(
           future: db
               .from('movimientos')
               .select('cantidad, insumos(nombre, unidad)')
               .eq('lote_id', l['id']),
-          builder: (ctx, s) => ListView(padding: const EdgeInsets.all(16), children: [
+          builder: (ctx, s) =>
+              ListView(padding: const EdgeInsets.all(16), children: [
             Text('Lote ${l['codigo']}',
-                style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: ambar)),
+                style: const TextStyle(
+                    fontSize: 20, fontWeight: FontWeight.bold, color: ambar)),
             const SizedBox(height: 4),
-            const Text('Insumos consumidos:', style: TextStyle(fontWeight: FontWeight.bold)),
+            const Text('Insumos consumidos:',
+                style: TextStyle(fontWeight: FontWeight.bold)),
             if (!s.hasData) const LinearProgressIndicator(),
-            for (final m in s.data ?? [])
+            for (final m in s.data ?? <Map<String, dynamic>>[])
               ListTile(
                 dense: true,
                 title: Text(m['insumos']['nombre']),
-                trailing: Text('${fmt((m['cantidad'] as num).abs())} ${m['insumos']['unidad']}'),
+                trailing: Text(
+                    '${fmt((m['cantidad'] as num).abs())} ${m['insumos']['unidad']}'),
               ),
           ]),
         ),
@@ -423,7 +501,9 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
 
   @override
   Widget build(BuildContext context) => Column(children: [
-        Align(alignment: Alignment.centerLeft, child: titulo('Lotes y Seguimiento')),
+        Align(
+            alignment: Alignment.centerLeft,
+            child: titulo('Lotes y Seguimiento')),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
           child: TextField(
@@ -431,7 +511,8 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
             decoration: InputDecoration(
               hintText: 'Buscar lote o producto...',
               prefixIcon: const Icon(Icons.search),
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+              border:
+                  OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
               filled: true,
               fillColor: Colors.white,
             ),
@@ -443,20 +524,26 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
               setState(() => f = cargar());
               await f;
             },
-            child: FutureBuilder<List<Map<String, dynamic>>>(
+            child: FutureBuilder<Filas>(
               future: f,
               builder: (ctx, s) {
-                if (!s.hasData) return const Center(child: CircularProgressIndicator());
+                if (!s.hasData) {
+                  return const Center(child: CircularProgressIndicator());
+                }
                 final lotes = s.data!
                     .where((l) =>
                         busqueda.isEmpty ||
                         '${l['codigo']}'.toLowerCase().contains(busqueda) ||
-                        '${l['productos']['nombre']}'.toLowerCase().contains(busqueda))
+                        '${l['productos']['nombre']}'
+                            .toLowerCase()
+                            .contains(busqueda))
                     .toList();
                 if (lotes.isEmpty) {
                   return ListView(children: const [
                     SizedBox(height: 120),
-                    Center(child: Text('Sin lotes. Se generan al dar salida a un producto.')),
+                    Center(
+                        child: Text(
+                            'Sin lotes. Se generan al dar salida a un producto.')),
                   ]);
                 }
                 return ListView.builder(
@@ -484,12 +571,15 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
         onTap: () => detalle(l),
         child: Padding(
           padding: const EdgeInsets.all(16),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
               Flexible(
                   child: Text(l['codigo'],
                       style: const TextStyle(
-                          fontSize: 18, fontWeight: FontWeight.bold, color: ambar))),
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          color: ambar))),
               Chip(
                 label: Text('${fmt(l['cantidad'])} ${p['unidad']}',
                     style: const TextStyle(color: Colors.white)),
@@ -499,7 +589,8 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
             const Divider(),
             Text('Producto: ${p['nombre']}'),
             Text('Fecha de producción: ${l['fecha']}'),
-            Text('Consumo recomendado: ${l['fecha_consumo_recomendado'] ?? '-'}'),
+            Text(
+                'Consumo recomendado: ${l['fecha_consumo_recomendado'] ?? '-'}'),
             for (final e in extra) Text(e),
             const SizedBox(height: 4),
             const Text('Toca para ver los insumos consumidos',
@@ -546,12 +637,16 @@ class ProduccionScreen extends StatelessWidget {
   }
 
   Future<void> darSalida(BuildContext c, Map<String, dynamic> p) async {
-    final f = await formulario(c, 'Salida de ${p['nombre']}', {
-      'cantidad': 'Cantidad de piezas',
-      'flora': 'Tipo de miel / flora (opcional)',
-      'apiario': 'Apiario de origen (opcional)',
-      'nota': 'Nota (opcional)',
-    }, numericos: {'cantidad'});
+    final f = await formulario(
+        c,
+        'Salida de ${p['nombre']}',
+        {
+          'cantidad': 'Cantidad de piezas',
+          'flora': 'Tipo de miel / flora (opcional)',
+          'apiario': 'Apiario de origen (opcional)',
+          'nota': 'Nota (opcional)',
+        },
+        numericos: {'cantidad'});
     if (f == null) return;
     final cant = num.tryParse(f['cantidad'] ?? '');
     if (cant == null || cant <= 0) return;
@@ -571,7 +666,11 @@ class ProduccionScreen extends StatelessWidget {
           title: const Text('Salida registrada'),
           content: SelectableText(
               'Lote: ${l['codigo']}\nConsumo recomendado: ${l['fecha_consumo_recomendado'] ?? 'sin definir'}\n\nSe descontaron los insumos de la receta.'),
-          actions: [FilledButton(onPressed: () => Navigator.pop(ctx), child: const Text('Listo'))],
+          actions: [
+            FilledButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Listo'))
+          ],
         ),
       );
     } catch (e) {
@@ -581,7 +680,11 @@ class ProduccionScreen extends StatelessWidget {
           builder: (ctx) => AlertDialog(
             title: const Text('No se pudo registrar'),
             content: Text(msgError(e)),
-            actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Entendido'))],
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('Entendido'))
+            ],
           ),
         );
       }
@@ -589,7 +692,8 @@ class ProduccionScreen extends StatelessWidget {
   }
 
   // Cuántas piezas alcanzan con el stock actual de insumos
-  int? alcanza(String pid, List<Map<String, dynamic>> recetas, Map<String, Map<String, dynamic>> ins) {
+  int? alcanza(
+      String pid, Filas recetas, Map<String, Map<String, dynamic>> ins) {
     final r = recetas.where((x) => x['producto_id'] == pid).toList();
     if (r.isEmpty) return null;
     int? m;
@@ -602,35 +706,42 @@ class ProduccionScreen extends StatelessWidget {
   }
 
   @override
-  Widget build(BuildContext context) => StreamBuilder<List<Map<String, dynamic>>>(
+  Widget build(BuildContext context) => StreamBuilder<Filas>(
         stream: flujo('productos'),
-        builder: (ctx, sp) => StreamBuilder<List<Map<String, dynamic>>>(
+        builder: (ctx, sp) => StreamBuilder<Filas>(
           stream: flujo('insumos'),
           builder: (ctx, si) {
             if (!sp.hasData || !si.hasData) {
               return const Center(child: CircularProgressIndicator());
             }
-            final ins = {for (final x in si.data!) x['id'] as String: x};
-            return FutureBuilder<List<Map<String, dynamic>>>(
+            final ins = <String, Map<String, dynamic>>{
+              for (final x in si.data!) x['id'] as String: x
+            };
+            return FutureBuilder<Filas>(
               future: db.from('producto_insumos').select(),
               builder: (ctx, sr) {
-                final recetas = sr.data ?? [];
+                final recetas = sr.data ?? <Map<String, dynamic>>[];
                 return Scaffold(
                   backgroundColor: Colors.transparent,
                   floatingActionButton: FloatingActionButton.extended(
                       backgroundColor: ambar,
                       onPressed: () => editar(ctx),
                       icon: const Icon(Icons.add, color: Colors.white),
-                      label: const Text('Nuevo Producto', style: TextStyle(color: Colors.white))),
+                      label: const Text('Nuevo Producto',
+                          style: TextStyle(color: Colors.white))),
                   body: Column(children: [
-                    Align(alignment: Alignment.centerLeft, child: titulo('Control de Producción y Envasado')),
+                    Align(
+                        alignment: Alignment.centerLeft,
+                        child: titulo('Control de Producción y Envasado')),
                     Expanded(
                       child: sp.data!.isEmpty
-                          ? const Center(child: Text('Sin productos. Crea el primero.'))
+                          ? const Center(
+                              child: Text('Sin productos. Crea el primero.'))
                           : ListView.builder(
                               padding: const EdgeInsets.fromLTRB(12, 4, 12, 90),
                               itemCount: sp.data!.length,
-                              itemBuilder: (_, k) => tarjeta(ctx, sp.data![k], recetas, ins),
+                              itemBuilder: (_, k) =>
+                                  tarjeta(ctx, sp.data![k], recetas, ins),
                             ),
                     ),
                   ]),
@@ -641,7 +752,7 @@ class ProduccionScreen extends StatelessWidget {
         ),
       );
 
-  Widget tarjeta(BuildContext c, Map<String, dynamic> p, List<Map<String, dynamic>> recetas,
+  Widget tarjeta(BuildContext c, Map<String, dynamic> p, Filas recetas,
       Map<String, Map<String, dynamic>> ins) {
     final a = alcanza(p['id'], recetas, ins);
     return Card(
@@ -652,12 +763,15 @@ class ProduccionScreen extends StatelessWidget {
             c, MaterialPageRoute(builder: (_) => RecetaScreen(producto: p))),
         child: Padding(
           padding: const EdgeInsets.all(12),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Row(children: [
               Expanded(
                   child: Text(p['nombre'],
                       style: const TextStyle(
-                          fontWeight: FontWeight.bold, fontSize: 16, color: ambar))),
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16,
+                          color: ambar))),
               PopupMenuButton<String>(
                 onSelected: (v) {
                   if (v == 'e') editar(c, p);
@@ -667,8 +781,10 @@ class ProduccionScreen extends StatelessWidget {
                 },
                 itemBuilder: (_) => const [
                   PopupMenuItem(value: 'e', child: Text('Editar')),
-                  PopupMenuItem(value: '+', child: Text('Entrada de existencia')),
-                  PopupMenuItem(value: '-', child: Text('Salida de existencia')),
+                  PopupMenuItem(
+                      value: '+', child: Text('Entrada de existencia')),
+                  PopupMenuItem(
+                      value: '-', child: Text('Salida de existencia')),
                   PopupMenuItem(value: 'x', child: Text('Eliminar')),
                 ],
               ),
@@ -677,7 +793,9 @@ class ProduccionScreen extends StatelessWidget {
                 a == null
                     ? 'Sin receta (toca para agregar insumos)'
                     : 'Con el stock actual alcanza para $a ${p['unidad']}',
-                style: TextStyle(color: a == null || a == 0 ? Colors.red : null, fontSize: 16)),
+                style: TextStyle(
+                    color: a == null || a == 0 ? Colors.red : null,
+                    fontSize: 16)),
             Text('Existencia: ${fmt(p['existencia'])} ${p['unidad']}'),
             const SizedBox(height: 8),
             SizedBox(
@@ -704,13 +822,14 @@ class RecetaScreen extends StatefulWidget {
 }
 
 class _RecetaScreenState extends State<RecetaScreen> {
-  Future<List<Map<String, dynamic>>> cargar() => db
+  Future<Filas> cargar() => db
       .from('producto_insumos')
       .select('insumo_id, cantidad, insumos(nombre, unidad)')
       .eq('producto_id', widget.producto['id']);
 
   Future<void> asignar() async {
-    final insumos = await db.from('insumos').select('id, nombre, unidad').order('nombre');
+    final Filas insumos =
+        await db.from('insumos').select('id, nombre, unidad').order('nombre');
     if (!mounted) return;
     String? sel;
     final cant = TextEditingController();
@@ -725,27 +844,43 @@ class _RecetaScreenState extends State<RecetaScreen> {
               isExpanded: true,
               items: [
                 for (final i in insumos)
-                  DropdownMenuItem(value: i['id'] as String, child: Text('${i['nombre']} (${i['unidad']})'))
+                  DropdownMenuItem<String>(
+                      value: i['id'] as String,
+                      child: Text('${i['nombre']} (${i['unidad']})'))
               ],
               onChanged: (v) => set(() => sel = v),
             ),
             TextField(
                 controller: cant,
-                keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                decoration: const InputDecoration(labelText: 'Cantidad por cada pieza')),
+                keyboardType:
+                    const TextInputType.numberWithOptions(decimal: true),
+                decoration:
+                    const InputDecoration(labelText: 'Cantidad por cada pieza')),
           ]),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Guardar')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancelar')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Guardar')),
         ],
       ),
     );
     final q = double.tryParse(cant.text);
+    cant.dispose();
     if (ok == true && sel != null && q != null && q > 0) {
-      await db.from('producto_insumos').upsert(
-          {'producto_id': widget.producto['id'], 'insumo_id': sel, 'cantidad': q});
-      setState(() {});
+      try {
+        await db.from('producto_insumos').upsert({
+          'producto_id': widget.producto['id'],
+          'insumo_id': sel,
+          'cantidad': q
+        });
+        if (mounted) setState(() {});
+      } catch (e) {
+        if (mounted) aviso(context, msgError(e));
+      }
     }
   }
 
@@ -756,26 +891,36 @@ class _RecetaScreenState extends State<RecetaScreen> {
             backgroundColor: ambar,
             onPressed: asignar,
             icon: const Icon(Icons.add, color: Colors.white),
-            label: const Text('Insumo', style: TextStyle(color: Colors.white))),
-        body: FutureBuilder<List<Map<String, dynamic>>>(
+            label:
+                const Text('Insumo', style: TextStyle(color: Colors.white))),
+        body: FutureBuilder<Filas>(
           future: cargar(),
           builder: (ctx, snap) {
-            if (!snap.hasData) return const Center(child: CircularProgressIndicator());
-            if (snap.data!.isEmpty) return const Center(child: Text('Sin insumos asignados'));
+            if (!snap.hasData) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            if (snap.data!.isEmpty) {
+              return const Center(child: Text('Sin insumos asignados'));
+            }
             return ListView(children: [
               for (final r in snap.data!)
                 ListTile(
                   title: Text(r['insumos']['nombre']),
-                  subtitle: Text('${fmt(r['cantidad'])} ${r['insumos']['unidad']} por pieza'),
+                  subtitle: Text(
+                      '${fmt(r['cantidad'])} ${r['insumos']['unidad']} por pieza'),
                   trailing: IconButton(
                     icon: const Icon(Icons.delete_outline, color: Colors.red),
                     onPressed: () async {
-                      await db
-                          .from('producto_insumos')
-                          .delete()
-                          .eq('producto_id', widget.producto['id'])
-                          .eq('insumo_id', r['insumo_id']);
-                      setState(() {});
+                      try {
+                        await db
+                            .from('producto_insumos')
+                            .delete()
+                            .eq('producto_id', widget.producto['id'])
+                            .eq('insumo_id', r['insumo_id']);
+                        if (mounted) setState(() {});
+                      } catch (e) {
+                        if (mounted) aviso(context, msgError(e));
+                      }
                     },
                   ),
                 ),
@@ -785,8 +930,581 @@ class _RecetaScreenState extends State<RecetaScreen> {
       );
 }
 
+// ================= 4. PROVEEDORES, UPP Y RASMIEL =================
+const Map<String, String> estadosMexico = {
+  '01': 'Aguascalientes',
+  '02': 'Baja California',
+  '03': 'Baja California Sur',
+  '04': 'Campeche',
+  '05': 'Coahuila',
+  '06': 'Colima',
+  '07': 'Chiapas',
+  '08': 'Chihuahua',
+  '09': 'Ciudad de México',
+  '10': 'Durango',
+  '11': 'Guanajuato',
+  '12': 'Guerrero',
+  '13': 'Hidalgo',
+  '14': 'Jalisco',
+  '15': 'Estado de México',
+  '16': 'Michoacán',
+  '17': 'Morelos',
+  '18': 'Nayarit',
+  '19': 'Nuevo León',
+  '20': 'Oaxaca',
+  '21': 'Puebla',
+  '22': 'Querétaro',
+  '23': 'Quintana Roo',
+  '24': 'San Luis Potosí',
+  '25': 'Sinaloa',
+  '26': 'Sonora',
+  '27': 'Tabasco',
+  '28': 'Tamaulipas',
+  '29': 'Tlaxcala',
+  '30': 'Veracruz',
+  '31': 'Yucatán',
+  '32': 'Zacatecas',
+};
+
+// Catálogo rápido de claves INEGI de municipios apícolas frecuentes por estado
+const Map<String, Map<String, String>> municipiosFrecuentes = {
+  '01': {
+    '001': 'Aguascalientes',
+    '002': 'Asientos',
+    '003': 'Calvillo',
+    '005': 'Jesús María',
+    '007': 'Rincón de Romos',
+  },
+  '04': {
+    '002': 'Campeche',
+    '003': 'Carmen',
+    '004': 'Champotón',
+    '006': 'Hopelchén',
+    '010': 'Calakmul',
+  },
+  '07': {
+    '019': 'Comitán de Domínguez',
+    '078': 'San Cristóbal de las Casas',
+    '089': 'Tapachula',
+    '101': 'Tuxtla Gutiérrez',
+  },
+  '14': {
+    '039': 'Guadalajara',
+    '098': 'Tlaquepaque',
+    '120': 'Zapopan',
+    '124': 'Zapotlán el Grande',
+  },
+  '23': {
+    '002': 'Felipe Carrillo Puerto',
+    '004': 'Othón P. Blanco',
+    '005': 'Benito Juárez',
+    '006': 'José María Morelos',
+  },
+  '31': {
+    '050': 'Mérida',
+    '053': 'Motul',
+    '059': 'Oxkutzcab',
+    '079': 'Tekax',
+    '096': 'Tizimín',
+    '102': 'Valladolid',
+  },
+};
+
+String generarHomoclave([Set<String> usadas = const {}]) {
+  final rng = Random();
+  String hc = '';
+  int intentos = 0;
+  do {
+    hc = rng.nextInt(1000).toString().padLeft(3, '0');
+    intentos++;
+  } while (usadas.contains(hc) && intentos < 50);
+  return hc;
+}
+
+String generarPredioAleatorio() {
+  final rng = Random();
+  return (rng.nextInt(999) + 1).toString().padLeft(4, '0');
+}
+
+class ProveedoresScreen extends StatefulWidget {
+  const ProveedoresScreen({super.key});
+  @override
+  State<ProveedoresScreen> createState() => _ProveedoresScreenState();
+}
+
+class _ProveedoresScreenState extends State<ProveedoresScreen> {
+  String busqueda = '';
+
+  Future<void> editarProveedor(
+    BuildContext c,
+    Filas existentes, [
+    Map<String, dynamic>? prov,
+  ]) async {
+    final rasmielUsados = existentes
+        .where((x) => x['id'] != prov?['id'])
+        .map((x) => '${x['rasmiel']}')
+        .toSet();
+
+    String estadoSel = prov?['estado_codigo'] ?? '31';
+    final munCodCtrl =
+        TextEditingController(text: prov?['municipio_codigo'] ?? '050');
+    final munNomCtrl =
+        TextEditingController(text: prov?['municipio_nombre'] ?? 'Mérida');
+    final predioCtrl = TextEditingController(
+        text: prov?['predio_num'] ?? generarPredioAleatorio());
+    final propCtrl =
+        TextEditingController(text: prov?['propietario_num'] ?? '001');
+    String homoclave = prov?['homoclave'] ?? generarHomoclave();
+
+    final nombreCtrl = TextEditingController(text: prov?['nombre'] ?? '');
+    final telCtrl = TextEditingController(text: prov?['telefono'] ?? '');
+    final notaCtrl = TextEditingController(text: prov?['nota'] ?? '');
+
+    String soloDigitos(String s) => s.trim().replaceAll(RegExp(r'[^0-9]'), '');
+    String padMun() => soloDigitos(munCodCtrl.text).padLeft(3, '0');
+    String padPredio() => soloDigitos(predioCtrl.text).padLeft(4, '0');
+    String padProp() => soloDigitos(propCtrl.text).padLeft(3, '0');
+
+    String construirUpp() => '$estadoSel${padMun()}${padPredio()}${padProp()}';
+    String construirRasmiel() =>
+        '$estadoSel${padMun()}${padPredio()}$homoclave';
+
+    final ok = await showDialog<bool>(
+      context: c,
+      builder: (ctx) => AlertDialog(
+        title: Text(
+            prov == null ? 'Nuevo productor / UPP' : 'Modificar productor'),
+        content: StatefulBuilder(
+          builder: (_, setModal) {
+            final uppPreview = construirUpp();
+            final rasmielPreview = construirRasmiel();
+            final presets = municipiosFrecuentes[estadoSel] ?? {};
+
+            return SingleChildScrollView(
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                // 1. Entidad federativa (2 dígitos)
+                DropdownButtonFormField<String>(
+                  initialValue: estadoSel,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                      labelText: 'Entidad federativa (2 dígitos)'),
+                  items: [
+                    for (final entry in estadosMexico.entries)
+                      DropdownMenuItem<String>(
+                        value: entry.key,
+                        child: Text('${entry.key} - ${entry.value}'),
+                      ),
+                  ],
+                  onChanged: (v) {
+                    if (v == null) return;
+                    setModal(() {
+                      estadoSel = v;
+                      final listaMun = municipiosFrecuentes[v];
+                      if (listaMun != null && listaMun.isNotEmpty) {
+                        final primer = listaMun.entries.first;
+                        munCodCtrl.text = primer.key;
+                        munNomCtrl.text = primer.value;
+                      } else {
+                        munCodCtrl.text = '001';
+                        munNomCtrl.text = '';
+                      }
+                    });
+                  },
+                ),
+                const SizedBox(height: 8),
+                // 2. Municipio INEGI (3 dígitos) + selector rápido
+                Row(children: [
+                  SizedBox(
+                    width: 115,
+                    child: TextField(
+                      controller: munCodCtrl,
+                      maxLength: 3,
+                      keyboardType: TextInputType.number,
+                      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                      decoration: const InputDecoration(
+                        labelText: 'Mun. INEGI',
+                        hintText: '050',
+                        counterText: '',
+                      ),
+                      onChanged: (_) => setModal(() {}),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: munNomCtrl,
+                      decoration: const InputDecoration(
+                        labelText: 'Nombre municipio',
+                        hintText: 'Ej. Mérida',
+                      ),
+                    ),
+                  ),
+                  if (presets.isNotEmpty)
+                    PopupMenuButton<MapEntry<String, String>>(
+                      tooltip: 'Municipios frecuentes',
+                      icon: const Icon(Icons.list_alt, color: ambar),
+                      onSelected: (entry) => setModal(() {
+                        munCodCtrl.text = entry.key;
+                        munNomCtrl.text = entry.value;
+                      }),
+                      itemBuilder: (_) => [
+                        for (final m in presets.entries)
+                          PopupMenuItem<MapEntry<String, String>>(
+                            value: m,
+                            child: Text('${m.key} - ${m.value}'),
+                          ),
+                      ],
+                    ),
+                ]),
+                const SizedBox(height: 8),
+                // 3. Predio / Consecutivo UPP (4 dígitos) y Propietario (3 dígitos)
+                Row(children: [
+                  Expanded(
+                    child: TextField(
+                      controller: predioCtrl,
+                      maxLength: 4,
+                      keyboardType: TextInputType.number,
+                      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                      decoration: const InputDecoration(
+                        labelText: 'Predio / UPP (4 díg.)',
+                        hintText: '0142',
+                        counterText: '',
+                      ),
+                      onChanged: (_) => setModal(() {}),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: propCtrl,
+                      maxLength: 3,
+                      keyboardType: TextInputType.number,
+                      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                      decoration: const InputDecoration(
+                        labelText: 'Propietario (3 díg.)',
+                        hintText: '001',
+                        counterText: '',
+                      ),
+                      onChanged: (_) => setModal(() {}),
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: 12),
+                // Vista previa de Clave UPP (12) y Clave RASMIEL (12)
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF9F6F0),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0x66D97706)),
+                  ),
+                  child: Row(children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('Clave UPP (12 dígitos):',
+                              style: TextStyle(
+                                  fontSize: 11, color: Colors.black54)),
+                          Text(uppPreview,
+                              style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                  letterSpacing: 0.8,
+                                  color: cafe)),
+                          const SizedBox(height: 6),
+                          Text('Clave RASMIEL (Homoclave $homoclave):',
+                              style: const TextStyle(
+                                  fontSize: 11, color: Colors.black54)),
+                          Text(rasmielPreview,
+                              style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                  letterSpacing: 0.8,
+                                  color: ambar)),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'Regenerar homoclave RASMIEL',
+                      icon: const Icon(Icons.refresh, color: ambar),
+                      onPressed: () => setModal(() {
+                        String nueva;
+                        int intentos = 0;
+                        do {
+                          nueva = generarHomoclave();
+                          intentos++;
+                        } while (rasmielUsados.contains(
+                                '$estadoSel${padMun()}${padPredio()}$nueva') &&
+                            intentos < 50);
+                        homoclave = nueva;
+                      }),
+                    ),
+                  ]),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: nombreCtrl,
+                  decoration: const InputDecoration(
+                      labelText: 'Nombre del productor / apicultor'),
+                ),
+                TextField(
+                  controller: telCtrl,
+                  keyboardType: TextInputType.phone,
+                  decoration:
+                      const InputDecoration(labelText: 'Teléfono (opcional)'),
+                ),
+                TextField(
+                  controller: notaCtrl,
+                  decoration: const InputDecoration(
+                      labelText: 'Localidad / Nota (opcional)'),
+                ),
+              ]),
+            );
+          },
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancelar')),
+          FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: ambar),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Guardar')),
+        ],
+      ),
+    );
+
+    final munCod = padMun();
+    final munNom = munNomCtrl.text.trim();
+    final predio = padPredio();
+    final prop = padProp();
+    final uppFinal = '$estadoSel$munCod$predio$prop';
+    final rasmielFinal = '$estadoSel$munCod$predio$homoclave';
+    final nombre = nombreCtrl.text.trim();
+    final tel = telCtrl.text.trim();
+    final nota = notaCtrl.text.trim();
+
+    munCodCtrl.dispose();
+    munNomCtrl.dispose();
+    predioCtrl.dispose();
+    propCtrl.dispose();
+    nombreCtrl.dispose();
+    telCtrl.dispose();
+    notaCtrl.dispose();
+
+    if (ok != true || nombre.isEmpty) return;
+
+    final payload = <String, dynamic>{
+      'upp_id': uppFinal,
+      'rasmiel': rasmielFinal,
+      'estado_codigo': estadoSel,
+      'estado_nombre': estadosMexico[estadoSel] ?? '',
+      'municipio_codigo': munCod,
+      'municipio_nombre': munNom.isEmpty ? null : munNom,
+      'predio_num': predio,
+      'propietario_num': prop,
+      'homoclave': homoclave,
+      'nombre': nombre,
+      'telefono': tel.isEmpty ? null : tel,
+      'nota': nota.isEmpty ? null : nota,
+    };
+
+    try {
+      if (prov == null) {
+        await db.from('proveedores').insert(payload);
+      } else {
+        await db.from('proveedores').update(payload).eq('id', prov['id']);
+      }
+    } catch (e) {
+      if (c.mounted) aviso(c, msgError(e));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => StreamBuilder<Filas>(
+        stream: flujo('proveedores'),
+        builder: (ctx, snap) {
+          if (!snap.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          final todos = snap.data!;
+          final lista = todos.where((p) {
+            if (busqueda.isEmpty) return true;
+            return '${p['nombre']}'.toLowerCase().contains(busqueda) ||
+                '${p['upp_id']}'.contains(busqueda) ||
+                '${p['rasmiel']}'.contains(busqueda) ||
+                '${p['estado_nombre']}'.toLowerCase().contains(busqueda) ||
+                '${p['municipio_nombre'] ?? ''}'
+                    .toLowerCase()
+                    .contains(busqueda);
+          }).toList();
+
+          return Scaffold(
+            backgroundColor: Colors.transparent,
+            floatingActionButton: FloatingActionButton(
+              backgroundColor: ambar,
+              tooltip: 'Añadir proveedor',
+              onPressed: () => editarProveedor(ctx, todos),
+              child: const Icon(Icons.add, color: Colors.white, size: 28),
+            ),
+            body: Column(children: [
+              Align(
+                  alignment: Alignment.centerLeft,
+                  child: titulo('Proveedores · UPP y RASMIEL')),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                child: TextField(
+                  onChanged: (v) =>
+                      setState(() => busqueda = v.trim().toLowerCase()),
+                  decoration: InputDecoration(
+                    hintText: 'Buscar por productor, UPP, RASMIEL o estado...',
+                    prefixIcon: const Icon(Icons.search),
+                    border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(10)),
+                    filled: true,
+                    fillColor: Colors.white,
+                  ),
+                ),
+              ),
+              Expanded(
+                child: lista.isEmpty
+                    ? const Center(
+                        child: Text(
+                            'Sin productores registrados. Pulsa "+" para añadir.'))
+                    : ListView.builder(
+                        padding: const EdgeInsets.fromLTRB(12, 0, 12, 90),
+                        itemCount: lista.length,
+                        itemBuilder: (_, k) =>
+                            tarjetaProveedor(ctx, lista[k], todos),
+                      ),
+              ),
+            ]),
+          );
+        },
+      );
+
+  Widget tarjetaProveedor(
+    BuildContext c,
+    Map<String, dynamic> p,
+    Filas todos,
+  ) {
+    final tel = (p['telefono'] ?? '') as String;
+    final nota = (p['nota'] ?? '') as String;
+    final munNom = (p['municipio_nombre'] ?? '') as String;
+    final ubicacion = munNom.isNotEmpty
+        ? '$munNom (${p['municipio_codigo']}), ${p['estado_nombre']} (${p['estado_codigo']})'
+        : 'Mun. ${p['municipio_codigo']}, ${p['estado_nombre']} (${p['estado_codigo']})';
+
+    return Card(
+      elevation: 2,
+      margin: const EdgeInsets.only(bottom: 12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: () => editarProveedor(c, todos, p),
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      p['nombre'],
+                      style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 17,
+                          color: cafe),
+                    ),
+                    Text(ubicacion,
+                        style: const TextStyle(
+                            fontSize: 12, color: Colors.black54)),
+                  ],
+                ),
+              ),
+              PopupMenuButton<String>(
+                onSelected: (v) => v == 'e'
+                    ? editarProveedor(c, todos, p)
+                    : eliminar(c, 'proveedores', p),
+                itemBuilder: (_) => const [
+                  PopupMenuItem(value: 'e', child: Text('Modificar')),
+                  PopupMenuItem(value: 'x', child: Text('Eliminar')),
+                ],
+              ),
+            ]),
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFFF9F6F0),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0x59D97706)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('Clave UPP (12 díg.)',
+                          style:
+                              TextStyle(fontSize: 11, color: Colors.black54)),
+                      Text(
+                          'Predio #${p['predio_num']} · Prop. ${p['propietario_num']}',
+                          style: const TextStyle(
+                              fontSize: 11, color: Colors.black54)),
+                    ],
+                  ),
+                  Text('${p['upp_id']}',
+                      style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1,
+                          color: cafe)),
+                  const Divider(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('Clave RASMIEL (SENASICA)',
+                          style:
+                              TextStyle(fontSize: 11, color: Colors.black54)),
+                      Text('Homoclave: ${p['homoclave']}',
+                          style: const TextStyle(
+                              fontSize: 11, color: Colors.black54)),
+                    ],
+                  ),
+                  Text('${p['rasmiel']}',
+                      style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1,
+                          color: ambar)),
+                ],
+              ),
+            ),
+            if (tel.isNotEmpty || nota.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              if (tel.isNotEmpty) Text('Tel: $tel'),
+              if (nota.isNotEmpty)
+                Text(nota, style: const TextStyle(color: Colors.black54)),
+            ],
+            const SizedBox(height: 6),
+            const Text('Toca el recuadro para modificar',
+                style: TextStyle(color: Colors.black45, fontSize: 12)),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
 // ---------------- UTILIDADES ----------------
-Future<void> mover(BuildContext c, String tabla, Map<String, dynamic> it, double signo) async {
+Future<void> mover(
+    BuildContext c, String tabla, Map<String, dynamic> it, double signo) async {
   final tipo = signo > 0 ? 'Entrada' : 'Salida';
   final cant = await pedirNumero(c, '$tipo · ${it['nombre']}');
   if (cant == null) return;
@@ -800,14 +1518,19 @@ Future<void> mover(BuildContext c, String tabla, Map<String, dynamic> it, double
   }
 }
 
-Future<void> eliminar(BuildContext c, String tabla, Map<String, dynamic> it) async {
+Future<void> eliminar(
+    BuildContext c, String tabla, Map<String, dynamic> it) async {
   final ok = await showDialog<bool>(
     context: c,
     builder: (ctx) => AlertDialog(
       title: Text('¿Eliminar "${it['nombre']}"?'),
       actions: [
-        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
-        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Eliminar')),
+        TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancelar')),
+        FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Eliminar')),
       ],
     ),
   );
@@ -822,11 +1545,14 @@ Future<void> eliminar(BuildContext c, String tabla, Map<String, dynamic> it) asy
 // Formulario genérico. Devuelve los textos, o {'__eliminar': '1'} si se pulsa Eliminar.
 Future<Map<String, String>?> formulario(
     BuildContext c, String titulo, Map<String, String> campos,
-    {Map<String, dynamic>? datos, bool eliminar = false, Set<String> numericos = const {}}) {
+    {Map<String, dynamic>? datos,
+    bool eliminar = false,
+    Set<String> numericos = const {}}) async {
   final ctrl = {
-    for (final k in campos.keys) k: TextEditingController(text: '${datos?[k] ?? ''}')
+    for (final k in campos.keys)
+      k: TextEditingController(text: '${datos?[k] ?? ''}')
   };
-  return showDialog<Map<String, String>>(
+  final res = await showDialog<Map<String, String>>(
     context: c,
     builder: (ctx) => AlertDialog(
       title: Text(titulo),
@@ -843,18 +1569,23 @@ Future<Map<String, String>?> formulario(
         ]),
       ),
       actions: [
-        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar')),
+        TextButton(
+            onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar')),
         if (eliminar)
           TextButton(
               onPressed: () => Navigator.pop(ctx, {'__eliminar': '1'}),
               child: const Text('Eliminar')),
         FilledButton(
-            onPressed: () =>
-                Navigator.pop(ctx, {for (final k in ctrl.keys) k: ctrl[k]!.text.trim()}),
+            onPressed: () => Navigator.pop(
+                ctx, {for (final k in ctrl.keys) k: ctrl[k]!.text.trim()}),
             child: const Text('Guardar')),
       ],
     ),
   );
+  for (final controller in ctrl.values) {
+    controller.dispose();
+  }
+  return res;
 }
 
 Future<double?> pedirNumero(BuildContext c, String titulo) async {
@@ -870,11 +1601,16 @@ Future<double?> pedirNumero(BuildContext c, String titulo) async {
           keyboardType: const TextInputType.numberWithOptions(decimal: true),
           decoration: const InputDecoration(labelText: 'Cantidad')),
       actions: [
-        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
-        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Aceptar')),
+        TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancelar')),
+        FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Aceptar')),
       ],
     ),
   );
   final v = double.tryParse(t.text);
+  t.dispose();
   return (ok == true && v != null && v > 0) ? v : null;
 }
