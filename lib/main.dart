@@ -37,6 +37,14 @@ String fmt(Object? n) {
   return v == v.roundToDouble() ? v.toInt().toString() : v.toString();
 }
 
+// Acepta coma o punto decimal. null = no es un número
+double? numero(String? t) {
+  final v = double.tryParse((t ?? '').trim().replaceAll(',', '.'));
+  return v != null && v.isFinite ? v : null;
+}
+
+const cantidadInvalida = 'No se guardó: escribe una cantidad mayor que cero';
+
 String msgError(Object e) {
   if (e is PostgrestException) {
     if (e.code == '23514') return 'Existencia insuficiente o formato inválido';
@@ -44,7 +52,9 @@ String msgError(Object e) {
       return 'No se puede eliminar: tiene movimientos, salidas o recetas asociados';
     }
     if (e.code == '23505') {
-      return 'Ya existe un registro con esa Clave UPP o Clave RASMIEL';
+      return e.message.contains('id_productor')
+          ? 'Ya existe un productor con ese ID'
+          : 'Ya existe un registro con esa clave';
     }
     return e.message;
   }
@@ -439,13 +449,18 @@ Future<void> editarInsumo(BuildContext c, Filas cats, String? catSel,
   final nombre = n.text.trim();
   final unidad = u.text.trim();
   final desc = d.text.trim();
-  final minVal = num.tryParse(m.text) ?? 0;
+  final minTexto = m.text.trim();
+  final minVal = minTexto.isEmpty ? 0 : numero(minTexto);
   n.dispose();
   u.dispose();
   d.dispose();
   m.dispose();
 
   if (ok != true || nombre.isEmpty) return;
+  if (minVal == null) {
+    if (c.mounted) aviso(c, 'No se guardó: el stock mínimo no es un número');
+    return;
+  }
   final datos = {
     'nombre': nombre,
     'unidad': unidad.isEmpty ? 'pza' : unidad,
@@ -475,9 +490,10 @@ enum TipoFlujo { entradas, salidas }
 
 const _selLote = '*, productos(nombre, unidad), '
     'entrada:movimientos!lotes_entrada_id_fkey('
-    'upp_origen, proveedores(nombre, upp_id))';
+    'upp_origen, proveedores(nombre, id_productor, upp_id))';
 const _selMovimiento = 'id, created_at, cantidad, nota, clave, upp_origen, '
-    'insumos(nombre, unidad), proveedores(nombre, upp_id, rasmiel)';
+    'insumos(nombre, unidad), '
+    'proveedores(nombre, id_productor, upp_id, rasmiel)';
 
 /// Entradas de miel que aún tienen saldo, de la más antigua a la más nueva.
 Future<Filas> entradasDisponibles() => db
@@ -556,12 +572,14 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
             '${r['codigo']}',
             '${r['productos']?['nombre'] ?? ''}',
             '${r['entrada']?['proveedores']?['nombre'] ?? ''}',
+            '${r['entrada']?['proveedores']?['id_productor'] ?? ''}',
             '${r['entrada']?['proveedores']?['upp_id'] ?? ''}',
           ]
         : [
             '${r['clave'] ?? ''}',
             '${r['insumos']?['nombre'] ?? ''}',
             '${r['proveedores']?['nombre'] ?? ''}',
+            '${r['proveedores']?['id_productor'] ?? ''}',
             '${r['proveedores']?['upp_id'] ?? ''}',
             '${r['proveedores']?['rasmiel'] ?? ''}',
             '${r['nota'] ?? ''}',
@@ -582,7 +600,8 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
             .order('nombre'),
         db
             .from('proveedores')
-            .select('id, nombre, upp_id, upp_otro, upp_otro_nombre')
+            .select(
+                'id, nombre, id_productor, upp_id, upp_otro, upp_otro_nombre')
             .order('nombre'),
         entradasDisponibles(),
       ]);
@@ -600,7 +619,7 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
     }
     String? insSel, provSel, uppSel, entSel;
     final cant = TextEditingController(), nota = TextEditingController();
-    double? cantidad() => double.tryParse(cant.text.replaceAll(',', '.'));
+    double? cantidad() => numero(cant.text);
     Map<String, dynamic>? insumo() =>
         insumos.where((i) => i['id'] == insSel).firstOrNull;
 
@@ -649,7 +668,7 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
                   isExpanded: true,
                   decoration: InputDecoration(
                       labelText: miel
-                          ? 'Productor (ID / UPP)'
+                          ? 'Productor (ID · UPP)'
                           : 'Proveedor (opcional)',
                       helperText: miel && provs.isEmpty
                           ? 'Primero registra un productor en Proveedores'
@@ -660,7 +679,8 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
                     for (final p in provs)
                       DropdownMenuItem<String?>(
                         value: p['id'] as String,
-                        child: Text('${p['nombre']} · UPP ${p['upp_id']}',
+                        child: Text(
+                            '${p['nombre']} · ID ${p['id_productor'] ?? 'sin capturar'} · UPP ${p['upp_id']}',
                             overflow: TextOverflow.ellipsis),
                       ),
                   ],
@@ -962,7 +982,8 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
                             ? 'Proveedor: ${prov['nombre']}'
                             : 'Origen: ${prov['nombre']}',
                         style: const TextStyle(fontWeight: FontWeight.bold)),
-                    Text('UPP ${prov['upp_id']}  ·  RASMIEL ${prov['rasmiel']}',
+                    Text(
+                        'ID ${prov['id_productor'] ?? 'sin capturar'}  ·  UPP ${prov['upp_id']}  ·  RASMIEL ${prov['rasmiel']}',
                         style: const TextStyle(
                             fontSize: 13, letterSpacing: 0.5, color: cafe)),
                     if (m['upp_origen'] != null &&
@@ -988,7 +1009,7 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
     final productor = origen?['proveedores'] as Map<String, dynamic>?;
     final extra = <String>[
       if (productor != null)
-        'Productor: ${productor['nombre']} · ID/UPP ${productor['upp_id']}',
+        'Productor: ${productor['nombre']} · ID ${productor['id_productor'] ?? 'sin capturar'} · UPP ${productor['upp_id']}',
       if (productor != null && origen?['upp_origen'] != productor['upp_id'])
         'UPP de otro: ${origen?['upp_origen']}',
       if (l['flora'] != null) 'Tipo de miel / flora: ${l['flora']}',
@@ -1045,7 +1066,7 @@ class ProduccionScreen extends StatelessWidget {
         p == null ? 'Nuevo producto' : 'Editar producto',
         {
           'nombre': 'Nombre',
-          'unidad': 'Unidad (pza, kg...)',
+          'unidad': 'Unidad, sin cantidad (pza, kg...)',
           'codigo': 'ID del producto (ej. MIEL1K)',
           'gramaje': 'Gramaje (ej. 500)',
           'gramaje_unidad': 'Unidad del gramaje (g o kg)',
@@ -1056,8 +1077,15 @@ class ProduccionScreen extends StatelessWidget {
             : {...p, 'gramaje': p['gramaje'] == null ? '' : fmt(p['gramaje'])},
         numericos: {'vida_util_meses', 'gramaje'});
     if (f == null || f['nombre']!.isEmpty) return;
-    final gTexto = f['gramaje']!.replaceAll(',', '.');
-    final gramaje = num.tryParse(gTexto);
+    if (RegExp(r'^\d').hasMatch(f['unidad']!)) {
+      if (c.mounted) {
+        aviso(c,
+            'No se guardó: en Unidad escribe solo pza, kg... La cantidad va en ⋮ > Entrada de existencia');
+      }
+      return;
+    }
+    final gTexto = f['gramaje']!;
+    final gramaje = numero(gTexto);
     var gUnidad = f['gramaje_unidad']!.toLowerCase();
     if (gUnidad.isEmpty || gUnidad == 'gr') gUnidad = 'g';
     if ((gTexto.isNotEmpty && (gramaje == null || gramaje <= 0)) ||
@@ -1143,8 +1171,11 @@ class ProduccionScreen extends StatelessWidget {
         },
         numericos: {'cantidad'});
     if (f == null) return;
-    final cant = num.tryParse(f['cantidad'] ?? '');
-    if (cant == null || cant <= 0) return;
+    final cant = numero(f['cantidad']);
+    if (cant == null || cant <= 0) {
+      if (c.mounted) aviso(c, cantidadInvalida);
+      return;
+    }
     try {
       final r = await db.rpc('registrar_salida_trazable', params: {
         'p_producto': p['id'],
@@ -1364,9 +1395,14 @@ class _RecetaScreenState extends State<RecetaScreen> {
         ],
       ),
     );
-    final q = double.tryParse(cant.text);
+    final q = numero(cant.text);
     cant.dispose();
-    if (ok == true && sel != null && q != null && q > 0) {
+    if (ok != true) return;
+    if (sel == null || q == null || q <= 0) {
+      if (mounted) {
+        aviso(context, sel == null ? 'No se guardó: elige un insumo' : cantidadInvalida);
+      }
+    } else {
       try {
         await db.from('producto_insumos').upsert({
           'producto_id': widget.producto['id'],
@@ -1553,11 +1589,23 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
     String homoclave = prov?['homoclave'] ?? generarHomoclave();
 
     final nombreCtrl = TextEditingController(text: prov?['nombre'] ?? '');
+    final idCtrl = TextEditingController(text: prov?['id_productor'] ?? '');
     final telCtrl = TextEditingController(text: prov?['telefono'] ?? '');
     final notaCtrl = TextEditingController(text: prov?['nota'] ?? '');
     final otroCtrl = TextEditingController(text: prov?['upp_otro'] ?? '');
     final otroNomCtrl =
         TextEditingController(text: prov?['upp_otro_nombre'] ?? '');
+    String idLimpio() => idCtrl.text.trim().toUpperCase();
+    // null = válido
+    String? errorId() {
+      final id = idLimpio();
+      if (id.isEmpty) return 'Obligatorio';
+      return existentes
+              .any((x) => x['id'] != prov?['id'] && x['id_productor'] == id)
+          ? 'Ya lo usa otro productor'
+          : null;
+    }
+
     bool otroValido() => otroCtrl.text.isEmpty || otroCtrl.text.length == 12;
 
     String soloDigitos(String s) => s.trim().replaceAll(RegExp(r'[^0-9]'), '');
@@ -1704,7 +1752,7 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Text('Clave UPP (12 dígitos):',
+                          const Text('UPP de la granja (se puede compartir):',
                               style: TextStyle(
                                   fontSize: 11, color: Colors.black54)),
                           Text(uppPreview,
@@ -1750,6 +1798,18 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
                       labelText: 'Nombre del productor / apicultor'),
                 ),
                 TextField(
+                  controller: idCtrl,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.allow(RegExp('[A-Za-z0-9]')),
+                  ],
+                  decoration: InputDecoration(
+                    labelText: 'ID del productor',
+                    helperText: 'Letras y números. Va en la clave',
+                    errorText: errorId(),
+                  ),
+                  onChanged: (_) => setModal(() {}),
+                ),
+                TextField(
                   controller: telCtrl,
                   keyboardType: TextInputType.phone,
                   decoration:
@@ -1788,7 +1848,7 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
           FilledButton(
               style: FilledButton.styleFrom(backgroundColor: ambar),
               onPressed: () {
-                if (otroValido()) Navigator.pop(ctx, true);
+                if (otroValido() && errorId() == null) Navigator.pop(ctx, true);
               },
               child: const Text('Guardar')),
         ],
@@ -1802,6 +1862,7 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
     final uppFinal = '$estadoSel$munCod$predio$prop';
     final rasmielFinal = '$estadoSel$munCod$predio$homoclave';
     final nombre = nombreCtrl.text.trim();
+    final idProductor = idLimpio();
     final tel = telCtrl.text.trim();
     final nota = notaCtrl.text.trim();
     final otro = otroCtrl.text;
@@ -1812,6 +1873,7 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
     predioCtrl.dispose();
     propCtrl.dispose();
     nombreCtrl.dispose();
+    idCtrl.dispose();
     telCtrl.dispose();
     notaCtrl.dispose();
     otroCtrl.dispose();
@@ -1830,6 +1892,7 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
       'propietario_num': prop,
       'homoclave': homoclave,
       'nombre': nombre,
+      'id_productor': idProductor,
       'telefono': tel.isEmpty ? null : tel,
       'nota': nota.isEmpty ? null : nota,
       'upp_otro': otro.isEmpty ? null : otro,
@@ -1858,6 +1921,7 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
           final lista = todos.where((p) {
             if (busqueda.isEmpty) return true;
             return '${p['nombre']}'.toLowerCase().contains(busqueda) ||
+                '${p['id_productor'] ?? ''}'.toLowerCase().contains(busqueda) ||
                 '${p['upp_id']}'.contains(busqueda) ||
                 '${p['upp_otro'] ?? ''}'.contains(busqueda) ||
                 '${p['rasmiel']}'.contains(busqueda) ||
@@ -1885,7 +1949,7 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
                   onChanged: (v) =>
                       setState(() => busqueda = v.trim().toLowerCase()),
                   decoration: InputDecoration(
-                    hintText: 'Buscar por productor, UPP, RASMIEL o estado...',
+                    hintText: 'Buscar por productor, ID, UPP, RASMIEL o estado...',
                     prefixIcon: const Icon(Icons.search),
                     border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(10)),
@@ -1945,6 +2009,8 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
                           fontSize: 17,
                           color: cafe),
                     ),
+                    Text('ID ${p['id_productor'] ?? 'sin capturar'}',
+                        style: const TextStyle(fontSize: 13, color: cafe)),
                     Text(ubicacion,
                         style: const TextStyle(
                             fontSize: 12, color: Colors.black54)),
@@ -2146,7 +2212,12 @@ Future<double?> pedirNumero(BuildContext c, String titulo) async {
       ],
     ),
   );
-  final v = double.tryParse(t.text);
+  final v = numero(t.text);
   t.dispose();
-  return (ok == true && v != null && v > 0) ? v : null;
+  if (ok != true) return null;
+  if (v == null || v <= 0) {
+    if (c.mounted) aviso(c, cantidadInvalida);
+    return null;
+  }
+  return v;
 }
