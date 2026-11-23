@@ -41,7 +41,7 @@ String msgError(Object e) {
   if (e is PostgrestException) {
     if (e.code == '23514') return 'Existencia insuficiente o formato inválido';
     if (e.code == '23503') {
-      return 'No se puede eliminar: tiene movimientos, lotes o recetas asociados';
+      return 'No se puede eliminar: tiene movimientos, salidas o recetas asociados';
     }
     if (e.code == '23505') {
       return 'Ya existe un registro con esa Clave UPP o Clave RASMIEL';
@@ -379,6 +379,7 @@ Future<void> editarInsumo(BuildContext c, Filas cats, String? catSel,
   final d = TextEditingController(text: it?['descripcion'] ?? '');
   final m = TextEditingController(text: fmt(it?['stock_minimo']));
   String? cat = it != null ? it['categoria_id'] : catSel;
+  bool esMiel = it?['es_miel'] == true;
   final ok = await showDialog<bool>(
     context: c,
     builder: (ctx) => AlertDialog(
@@ -415,6 +416,13 @@ Future<void> editarInsumo(BuildContext c, Filas cats, String? catSel,
               ],
               onChanged: (v) => set(() => cat = v),
             ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Es miel'),
+              subtitle: const Text('Genera clave de trazabilidad'),
+              value: esMiel,
+              onChanged: (v) => set(() => esMiel = v),
+            ),
           ]),
         ),
       ),
@@ -444,6 +452,7 @@ Future<void> editarInsumo(BuildContext c, Filas cats, String? catSel,
     'descripcion': desc.isEmpty ? null : desc,
     'stock_minimo': minVal,
     'categoria_id': cat,
+    'es_miel': esMiel,
   };
   try {
     if (it == null) {
@@ -456,7 +465,38 @@ Future<void> editarInsumo(BuildContext c, Filas cats, String? catSel,
   }
 }
 
-// ================= 2. TRAZABILIDAD (lotes) =================
+// ================= 2. TRAZABILIDAD (entradas y salidas) =================
+// Entradas: movimientos de insumos con cantidad > 0, ligados a un proveedor.
+// Salidas: movimientos de insumos con cantidad < 0 (manuales) + lotes de
+// producto (salidas generadas desde Producción).
+// Requiere la columna movimientos.proveedor_id
+// y la clave de trazabilidad (ver supabase/migrations).
+enum TipoFlujo { entradas, salidas }
+
+const _selLote = '*, productos(nombre, unidad), '
+    'entrada:movimientos!lotes_entrada_id_fkey('
+    'upp_origen, proveedores(nombre, upp_id))';
+const _selMovimiento = 'id, created_at, cantidad, nota, clave, upp_origen, '
+    'insumos(nombre, unidad), proveedores(nombre, upp_id, rasmiel)';
+
+/// Entradas de miel que aún tienen saldo, de la más antigua a la más nueva.
+Future<Filas> entradasDisponibles() => db
+    .from('entradas_miel')
+    .select()
+    .gt('disponible', 0)
+    .order('created_at', ascending: true);
+
+String textoEntrada(Map<String, dynamic> e) =>
+    '${e['clave']} · ${e['productor'] ?? 'Sin productor'} · '
+    '${fmt(e['disponible'])} ${e['unidad']}';
+
+String fechaHora(Object? iso) {
+  final d = DateTime.tryParse('${iso ?? ''}')?.toLocal();
+  if (d == null) return '-';
+  String dos(int n) => n.toString().padLeft(2, '0');
+  return '${dos(d.day)}/${dos(d.month)}/${d.year} ${dos(d.hour)}:${dos(d.minute)}';
+}
+
 class TrazabilidadScreen extends StatefulWidget {
   const TrazabilidadScreen({super.key});
   @override
@@ -464,13 +504,275 @@ class TrazabilidadScreen extends StatefulWidget {
 }
 
 class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
+  TipoFlujo modo = TipoFlujo.entradas;
   late Future<Filas> f = cargar();
   String busqueda = '';
 
-  Future<Filas> cargar() => db
-      .from('lotes')
-      .select('*, productos(nombre, unidad)')
-      .order('created_at', ascending: false);
+  bool get esEntrada => modo == TipoFlujo.entradas;
+
+  Future<Filas> cargar() async {
+    if (modo == TipoFlujo.entradas) {
+      return db
+          .from('movimientos')
+          .select(_selMovimiento)
+          .not('insumo_id', 'is', null)
+          .gt('cantidad', 0)
+          .order('created_at', ascending: false);
+    }
+    final r = await Future.wait<Filas>([
+      // Salidas manuales de insumos (las de receta se ven dentro de cada lote)
+      db
+          .from('movimientos')
+          .select(_selMovimiento)
+          .not('insumo_id', 'is', null)
+          .lt('cantidad', 0)
+          .isFilter('lote_id', null),
+      db.from('lotes').select(_selLote),
+    ]);
+    final todos = <Map<String, dynamic>>[
+      for (final m in r[0]) {...m, '_tipo': 'mov'},
+      for (final l in r[1]) {...l, '_tipo': 'lote'},
+    ];
+    todos.sort(
+        (a, b) => '${b['created_at']}'.compareTo('${a['created_at']}'));
+    return todos;
+  }
+
+  void recargar() => setState(() => f = cargar());
+
+  void cambiarModo(TipoFlujo m) {
+    if (m == modo) return;
+    setState(() {
+      modo = m;
+      f = cargar();
+    });
+  }
+
+  bool coincide(Map<String, dynamic> r) {
+    if (busqueda.isEmpty) return true;
+    final textos = r['_tipo'] == 'lote'
+        ? [
+            '${r['clave'] ?? ''}',
+            '${r['codigo']}',
+            '${r['productos']?['nombre'] ?? ''}',
+            '${r['entrada']?['proveedores']?['nombre'] ?? ''}',
+            '${r['entrada']?['proveedores']?['upp_id'] ?? ''}',
+          ]
+        : [
+            '${r['clave'] ?? ''}',
+            '${r['insumos']?['nombre'] ?? ''}',
+            '${r['proveedores']?['nombre'] ?? ''}',
+            '${r['proveedores']?['upp_id'] ?? ''}',
+            '${r['proveedores']?['rasmiel'] ?? ''}',
+            '${r['nota'] ?? ''}',
+          ];
+    return textos.any((t) => t.toLowerCase().contains(busqueda));
+  }
+
+  // Registra una entrada o salida tomando insumos y proveedores ya dados de alta.
+  Future<void> registrar() async {
+    final entrada = esEntrada;
+    final Filas insumos;
+    final Filas provs, entradas;
+    try {
+      final r = await Future.wait<Filas>([
+        db
+            .from('insumos')
+            .select('id, nombre, unidad, existencia, es_miel')
+            .order('nombre'),
+        db
+            .from('proveedores')
+            .select('id, nombre, upp_id, upp_otro, upp_otro_nombre')
+            .order('nombre'),
+        entradasDisponibles(),
+      ]);
+      insumos = r[0];
+      provs = r[1];
+      entradas = r[2];
+    } catch (e) {
+      if (mounted) aviso(context, msgError(e));
+      return;
+    }
+    if (!mounted) return;
+    if (insumos.isEmpty) {
+      aviso(context, 'Primero registra insumos en la pestaña Inventario');
+      return;
+    }
+    String? insSel, provSel, uppSel, entSel;
+    final cant = TextEditingController(), nota = TextEditingController();
+    double? cantidad() => double.tryParse(cant.text.replaceAll(',', '.'));
+    Map<String, dynamic>? insumo() =>
+        insumos.where((i) => i['id'] == insSel).firstOrNull;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (_, set) {
+        final q = cantidad();
+        final i = insumo();
+        final miel = i?['es_miel'] == true;
+        final prov = provs.where((p) => p['id'] == provSel).firstOrNull;
+        final origenes =
+            entradas.where((e) => e['insumo_id'] == insSel).toList();
+        final ent = origenes.where((e) => e['id'] == entSel).firstOrNull;
+        final excede =
+            ent != null && q != null && q > (ent['disponible'] as num);
+        final valido = insSel != null &&
+            q != null &&
+            q > 0 &&
+            (!miel || (entrada ? provSel != null : ent != null)) &&
+            !excede;
+        return AlertDialog(
+          title: Text(entrada ? 'Registrar entrada' : 'Registrar salida'),
+          content: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              DropdownButtonFormField<String>(
+                initialValue: insSel,
+                isExpanded: true,
+                decoration: const InputDecoration(labelText: 'Insumo'),
+                items: [
+                  for (final x in insumos)
+                    DropdownMenuItem<String>(
+                      value: x['id'] as String,
+                      child: Text(
+                          '${x['nombre']} · ${fmt(x['existencia'])} ${x['unidad']}',
+                          overflow: TextOverflow.ellipsis),
+                    ),
+                ],
+                onChanged: (v) => set(() {
+                  insSel = v;
+                  entSel = null;
+                }),
+              ),
+              if (entrada)
+                DropdownButtonFormField<String?>(
+                  initialValue: provSel,
+                  isExpanded: true,
+                  decoration: InputDecoration(
+                      labelText: miel
+                          ? 'Productor (ID / UPP)'
+                          : 'Proveedor (opcional)',
+                      helperText: miel && provs.isEmpty
+                          ? 'Primero registra un productor en Proveedores'
+                          : null),
+                  items: [
+                    const DropdownMenuItem<String?>(
+                        value: null, child: Text('Sin proveedor')),
+                    for (final p in provs)
+                      DropdownMenuItem<String?>(
+                        value: p['id'] as String,
+                        child: Text('${p['nombre']} · UPP ${p['upp_id']}',
+                            overflow: TextOverflow.ellipsis),
+                      ),
+                  ],
+                  onChanged: (v) => set(() {
+                    provSel = v;
+                    uppSel = null;
+                  }),
+                ),
+              if (entrada && miel && prov?['upp_otro'] != null)
+                DropdownButtonFormField<String?>(
+                  key: ValueKey(provSel),
+                  initialValue: uppSel,
+                  isExpanded: true,
+                  decoration:
+                      const InputDecoration(labelText: 'Origen de la miel'),
+                  items: [
+                    DropdownMenuItem<String?>(
+                        value: null,
+                        child: Text('Granja propia · ${prov!['upp_id']}',
+                            overflow: TextOverflow.ellipsis)),
+                    DropdownMenuItem<String?>(
+                        value: prov['upp_otro'] as String,
+                        child: Text(
+                            'UPP de otro · ${prov['upp_otro']} ${prov['upp_otro_nombre'] ?? ''}',
+                            overflow: TextOverflow.ellipsis)),
+                  ],
+                  onChanged: (v) => set(() => uppSel = v),
+                ),
+              if (!entrada && miel)
+                DropdownButtonFormField<String>(
+                  key: ValueKey(insSel),
+                  initialValue: entSel,
+                  isExpanded: true,
+                  decoration: InputDecoration(
+                      labelText: 'Entrada de miel de origen',
+                      helperText: origenes.isEmpty
+                          ? 'No hay entradas con saldo de esta miel'
+                          : null),
+                  items: [
+                    for (final e in origenes)
+                      DropdownMenuItem<String>(
+                        value: e['id'] as String,
+                        child: Text(textoEntrada(e),
+                            overflow: TextOverflow.ellipsis),
+                      ),
+                  ],
+                  onChanged: (v) => set(() => entSel = v),
+                ),
+              TextField(
+                controller: cant,
+                keyboardType:
+                    const TextInputType.numberWithOptions(decimal: true),
+                style: const TextStyle(fontSize: 20),
+                decoration: InputDecoration(
+                    labelText: 'Cantidad',
+                    errorText:
+                        excede ? 'Supera el saldo de esa entrada' : null,
+                    suffixText: i == null ? null : '${i['unidad']}',
+                    helperText: !entrada && i != null
+                        ? 'Existencia: ${fmt(i['existencia'])} ${i['unidad']}'
+                        : null),
+                onChanged: (_) => set(() {}),
+              ),
+              TextField(
+                controller: nota,
+                decoration: InputDecoration(
+                    labelText: entrada
+                        ? 'Nota (factura, remisión...)'
+                        : 'Nota (destino, motivo...)'),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancelar')),
+            FilledButton(
+                style: FilledButton.styleFrom(backgroundColor: ambar),
+                onPressed: valido ? () => Navigator.pop(ctx, true) : null,
+                child: const Text('Guardar')),
+          ],
+        );
+      }),
+    );
+    final q = cantidad();
+    final n = nota.text.trim();
+    cant.dispose();
+    nota.dispose();
+    if (ok != true || insSel == null || q == null || q <= 0) return;
+
+    try {
+      final r = await db
+          .from('movimientos')
+          .insert({
+            'insumo_id': insSel,
+            'proveedor_id': entrada ? provSel : null,
+            'upp_origen': entrada ? uppSel : null,
+            'entrada_id': entrada ? null : entSel,
+            'cantidad': entrada ? q : -q,
+            'nota': n.isEmpty ? null : n,
+          })
+          .select('clave')
+          .single();
+      if (!mounted) return;
+      final hecho = entrada ? 'Entrada registrada' : 'Salida registrada';
+      aviso(context,
+          r['clave'] == null ? hecho : '$hecho · Clave ${r['clave']}');
+      recargar();
+    } catch (e) {
+      if (mounted) aviso(context, msgError(e));
+    }
+  }
 
   void detalle(Map<String, dynamic> l) => showModalBottomSheet(
         context: context,
@@ -481,7 +783,7 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
               .eq('lote_id', l['id']),
           builder: (ctx, s) =>
               ListView(padding: const EdgeInsets.all(16), children: [
-            Text('Lote ${l['codigo']}',
+            Text('${l['clave'] ?? l['codigo']}',
                 style: const TextStyle(
                     fontSize: 20, fontWeight: FontWeight.bold, color: ambar)),
             const SizedBox(height: 4),
@@ -500,66 +802,195 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
       );
 
   @override
-  Widget build(BuildContext context) => Column(children: [
-        Align(
-            alignment: Alignment.centerLeft,
-            child: titulo('Lotes y Seguimiento')),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-          child: TextField(
-            onChanged: (v) => setState(() => busqueda = v.trim().toLowerCase()),
-            decoration: InputDecoration(
-              hintText: 'Buscar lote o producto...',
-              prefixIcon: const Icon(Icons.search),
-              border:
-                  OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
-              filled: true,
-              fillColor: Colors.white,
+  Widget build(BuildContext context) => Scaffold(
+        backgroundColor: Colors.transparent,
+        floatingActionButton: FloatingActionButton.extended(
+          backgroundColor: ambar,
+          onPressed: registrar,
+          icon: Icon(esEntrada ? Icons.login : Icons.logout,
+              color: Colors.white),
+          label: Text(esEntrada ? 'Entrada' : 'Salida',
+              style: const TextStyle(color: Colors.white)),
+        ),
+        body: Column(children: [
+          Align(
+              alignment: Alignment.centerLeft,
+              child: titulo('Trazabilidad · Entradas y Salidas')),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+            child: SizedBox(
+              width: double.infinity,
+              child: SegmentedButton<TipoFlujo>(
+                showSelectedIcon: false,
+                style: SegmentedButton.styleFrom(
+                  selectedBackgroundColor: ambar,
+                  selectedForegroundColor: Colors.white,
+                  minimumSize: const Size(0, 48),
+                  textStyle: const TextStyle(fontSize: 16),
+                ),
+                segments: const [
+                  ButtonSegment(
+                      value: TipoFlujo.entradas,
+                      icon: Icon(Icons.login),
+                      label: Text('Entradas')),
+                  ButtonSegment(
+                      value: TipoFlujo.salidas,
+                      icon: Icon(Icons.logout),
+                      label: Text('Salidas')),
+                ],
+                selected: {modo},
+                onSelectionChanged: (s) => cambiarModo(s.first),
+              ),
             ),
           ),
-        ),
-        Expanded(
-          child: RefreshIndicator(
-            onRefresh: () async {
-              setState(() => f = cargar());
-              await f;
-            },
-            child: FutureBuilder<Filas>(
-              future: f,
-              builder: (ctx, s) {
-                if (!s.hasData) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-                final lotes = s.data!
-                    .where((l) =>
-                        busqueda.isEmpty ||
-                        '${l['codigo']}'.toLowerCase().contains(busqueda) ||
-                        '${l['productos']['nombre']}'
-                            .toLowerCase()
-                            .contains(busqueda))
-                    .toList();
-                if (lotes.isEmpty) {
-                  return ListView(children: const [
-                    SizedBox(height: 120),
-                    Center(
-                        child: Text(
-                            'Sin lotes. Se generan al dar salida a un producto.')),
-                  ]);
-                }
-                return ListView.builder(
-                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
-                  itemCount: lotes.length,
-                  itemBuilder: (_, k) => loteCard(lotes[k]),
-                );
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+            child: TextField(
+              onChanged: (v) =>
+                  setState(() => busqueda = v.trim().toLowerCase()),
+              decoration: InputDecoration(
+                hintText: esEntrada
+                    ? 'Buscar clave, insumo, productor o UPP...'
+                    : 'Buscar clave, producto, insumo o productor...',
+                prefixIcon: const Icon(Icons.search),
+                border:
+                    OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                filled: true,
+                fillColor: Colors.white,
+              ),
+            ),
+          ),
+          Expanded(
+            child: RefreshIndicator(
+              onRefresh: () async {
+                recargar();
+                await f;
               },
+              child: FutureBuilder<Filas>(
+                future: f,
+                builder: (ctx, s) {
+                  if (s.hasError) {
+                    return ListView(children: [
+                      const SizedBox(height: 120),
+                      Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Text(
+                            'No se pudieron cargar los registros.\n${msgError(s.error!)}',
+                            textAlign: TextAlign.center),
+                      ),
+                    ]);
+                  }
+                  if (!s.hasData) {
+                    return const Center(child: CircularProgressIndicator());
+                  }
+                  final filas = s.data!.where(coincide).toList();
+                  if (filas.isEmpty) {
+                    return ListView(children: [
+                      const SizedBox(height: 120),
+                      Center(
+                          child: Text(esEntrada
+                              ? 'Sin entradas. Pulsa "Entrada" para registrar una.'
+                              : 'Sin salidas. Registra una o da salida a un producto.')),
+                    ]);
+                  }
+                  return ListView.builder(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 90),
+                    itemCount: filas.length,
+                    itemBuilder: (_, k) => filas[k]['_tipo'] == 'lote'
+                        ? loteCard(filas[k])
+                        : movimientoCard(filas[k]),
+                  );
+                },
+              ),
             ),
           ),
-        ),
-      ]);
+        ]),
+      );
+
+  Widget movimientoCard(Map<String, dynamic> m) {
+    final ins = m['insumos'] as Map<String, dynamic>?;
+    final prov = m['proveedores'] as Map<String, dynamic>?;
+    final entrada = (m['cantidad'] as num) > 0;
+    final color = entrada ? const Color(0xFF15803D) : const Color(0xFFB45309);
+    final nota = (m['nota'] ?? '') as String;
+    return Card(
+      elevation: 2,
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Icon(entrada ? Icons.login : Icons.logout, color: color),
+            const SizedBox(width: 8),
+            Expanded(
+                child: Text('${ins?['nombre'] ?? 'Insumo eliminado'}',
+                    style: const TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.bold,
+                        color: cafe))),
+            Chip(
+              label: Text(
+                  '${entrada ? '+' : '-'}${fmt((m['cantidad'] as num).abs())} ${ins?['unidad'] ?? ''}',
+                  style: const TextStyle(color: Colors.white)),
+              backgroundColor: color,
+            ),
+          ]),
+          Text(fechaHora(m['created_at']),
+              style: const TextStyle(fontSize: 12, color: Colors.black54)),
+          if (m['clave'] != null)
+            SelectableText('${m['clave']}',
+                style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 0.5,
+                    color: ambar)),
+          const SizedBox(height: 8),
+          if (prov != null)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFFF9F6F0),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0x59D97706)),
+              ),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                        entrada
+                            ? 'Proveedor: ${prov['nombre']}'
+                            : 'Origen: ${prov['nombre']}',
+                        style: const TextStyle(fontWeight: FontWeight.bold)),
+                    Text('UPP ${prov['upp_id']}  ·  RASMIEL ${prov['rasmiel']}',
+                        style: const TextStyle(
+                            fontSize: 13, letterSpacing: 0.5, color: cafe)),
+                    if (m['upp_origen'] != null &&
+                        m['upp_origen'] != prov['upp_id'])
+                      Text('UPP de otro: ${m['upp_origen']}'),
+                  ]),
+            )
+          else
+            Text(entrada ? 'Sin proveedor' : 'Sin proveedor de origen',
+                style: const TextStyle(color: Colors.black45)),
+          if (nota.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text('Nota: $nota'),
+          ],
+        ]),
+      ),
+    );
+  }
 
   Widget loteCard(Map<String, dynamic> l) {
     final p = l['productos'];
+    final origen = l['entrada'] as Map<String, dynamic>?;
+    final productor = origen?['proveedores'] as Map<String, dynamic>?;
     final extra = <String>[
+      if (productor != null)
+        'Productor: ${productor['nombre']} · ID/UPP ${productor['upp_id']}',
+      if (productor != null && origen?['upp_origen'] != productor['upp_id'])
+        'UPP de otro: ${origen?['upp_origen']}',
       if (l['flora'] != null) 'Tipo de miel / flora: ${l['flora']}',
       if (l['apiario'] != null) 'Apiario de origen: ${l['apiario']}',
       if (l['nota'] != null) 'Nota: ${l['nota']}',
@@ -575,7 +1006,7 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
               Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
               Flexible(
-                  child: Text(l['codigo'],
+                  child: Text('${l['clave'] ?? l['codigo']}',
                       style: const TextStyle(
                           fontSize: 18,
                           fontWeight: FontWeight.bold,
@@ -586,6 +1017,8 @@ class _TrazabilidadScreenState extends State<TrazabilidadScreen> {
                 backgroundColor: const Color(0xFFB45309),
               ),
             ]),
+            const Text('Salida de producto',
+                style: TextStyle(fontSize: 12, color: Colors.black54)),
             const Divider(),
             Text('Producto: ${p['nombre']}'),
             Text('Fecha de producción: ${l['fecha']}'),
@@ -613,16 +1046,31 @@ class ProduccionScreen extends StatelessWidget {
         {
           'nombre': 'Nombre',
           'unidad': 'Unidad (pza, kg...)',
-          'codigo': 'Código para el lote (ej. MIEL1K)',
+          'codigo': 'ID del producto (ej. MIEL1K)',
+          'gramaje': 'Gramaje (ej. 500)',
+          'gramaje_unidad': 'Unidad del gramaje (g o kg)',
           'vida_util_meses': 'Vida útil en meses (consumo recomendado)',
         },
-        datos: p ?? {'unidad': 'pza'},
-        numericos: {'vida_util_meses'});
+        datos: p == null
+            ? {'unidad': 'pza', 'gramaje_unidad': 'g'}
+            : {...p, 'gramaje': p['gramaje'] == null ? '' : fmt(p['gramaje'])},
+        numericos: {'vida_util_meses', 'gramaje'});
     if (f == null || f['nombre']!.isEmpty) return;
+    final gTexto = f['gramaje']!.replaceAll(',', '.');
+    final gramaje = num.tryParse(gTexto);
+    var gUnidad = f['gramaje_unidad']!.toLowerCase();
+    if (gUnidad.isEmpty || gUnidad == 'gr') gUnidad = 'g';
+    if ((gTexto.isNotEmpty && (gramaje == null || gramaje <= 0)) ||
+        !{'g', 'kg'}.contains(gUnidad)) {
+      if (c.mounted) aviso(c, 'Gramaje inválido: usa un número y g o kg');
+      return;
+    }
     final d = <String, dynamic>{
       'nombre': f['nombre'],
       'unidad': f['unidad']!.isEmpty ? 'pza' : f['unidad'],
       'codigo': f['codigo']!.isEmpty ? null : f['codigo']!.toUpperCase(),
+      'gramaje': gramaje,
+      'gramaje_unidad': gUnidad,
       'vida_util_meses': int.tryParse(f['vida_util_meses']!),
     };
     try {
@@ -636,7 +1084,54 @@ class ProduccionScreen extends StatelessWidget {
     }
   }
 
+  // Pide de qué entrada sale la miel. null = cancelado.
+  Future<String?> elegirEntrada(BuildContext c, Filas entradas) =>
+      showDialog<String>(
+        context: c,
+        builder: (ctx) => SimpleDialog(
+          title: const Text('¿De qué entrada sale la miel?'),
+          children: [
+            for (final e in entradas)
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, e['id'] as String),
+                child: Text(textoEntrada(e)),
+              ),
+          ],
+        ),
+      );
+
   Future<void> darSalida(BuildContext c, Map<String, dynamic> p) async {
+    String? entradaId;
+    try {
+      final Filas receta = await db
+          .from('producto_insumos')
+          .select('insumo_id, insumos(es_miel)')
+          .eq('producto_id', p['id']);
+      final mieles = receta
+          .where((r) => r['insumos']?['es_miel'] == true)
+          .map((r) => r['insumo_id'])
+          .toSet();
+      if (mieles.isNotEmpty) {
+        if (p['gramaje'] == null) {
+          if (c.mounted) aviso(c, 'Primero define el gramaje del producto');
+          return;
+        }
+        final entradas = (await entradasDisponibles())
+            .where((e) => mieles.contains(e['insumo_id']))
+            .toList();
+        if (!c.mounted) return;
+        if (entradas.isEmpty) {
+          aviso(c, 'No hay entradas con saldo. Regístrala en Trazabilidad');
+          return;
+        }
+        entradaId = await elegirEntrada(c, entradas);
+        if (entradaId == null) return;
+      }
+    } catch (e) {
+      if (c.mounted) aviso(c, msgError(e));
+      return;
+    }
+    if (!c.mounted) return;
     final f = await formulario(
         c,
         'Salida de ${p['nombre']}',
@@ -651,12 +1146,13 @@ class ProduccionScreen extends StatelessWidget {
     final cant = num.tryParse(f['cantidad'] ?? '');
     if (cant == null || cant <= 0) return;
     try {
-      final r = await db.rpc('registrar_salida_producto', params: {
+      final r = await db.rpc('registrar_salida_trazable', params: {
         'p_producto': p['id'],
         'p_cantidad': cant,
         'p_nota': f['nota'],
         'p_flora': f['flora'],
         'p_apiario': f['apiario'],
+        'p_entrada': entradaId,
       });
       final l = r is List ? r.first : r;
       if (!c.mounted) return;
@@ -665,7 +1161,7 @@ class ProduccionScreen extends StatelessWidget {
         builder: (ctx) => AlertDialog(
           title: const Text('Salida registrada'),
           content: SelectableText(
-              'Lote: ${l['codigo']}\nConsumo recomendado: ${l['fecha_consumo_recomendado'] ?? 'sin definir'}\n\nSe descontaron los insumos de la receta.'),
+              'Clave: ${l['clave'] ?? l['codigo']}\nConsumo recomendado: ${l['fecha_consumo_recomendado'] ?? 'sin definir'}\n\nSe descontaron los insumos de la receta.'),
           actions: [
             FilledButton(
                 onPressed: () => Navigator.pop(ctx),
@@ -804,7 +1300,7 @@ class ProduccionScreen extends StatelessWidget {
                   style: grande,
                   onPressed: () => darSalida(c, p),
                   icon: const Icon(Icons.output),
-                  label: const Text('Dar salida (genera lote)')),
+                  label: const Text('Dar salida (genera clave)')),
             ),
           ]),
         ),
@@ -1059,6 +1555,10 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
     final nombreCtrl = TextEditingController(text: prov?['nombre'] ?? '');
     final telCtrl = TextEditingController(text: prov?['telefono'] ?? '');
     final notaCtrl = TextEditingController(text: prov?['nota'] ?? '');
+    final otroCtrl = TextEditingController(text: prov?['upp_otro'] ?? '');
+    final otroNomCtrl =
+        TextEditingController(text: prov?['upp_otro_nombre'] ?? '');
+    bool otroValido() => otroCtrl.text.isEmpty || otroCtrl.text.length == 12;
 
     String soloDigitos(String s) => s.trim().replaceAll(RegExp(r'[^0-9]'), '');
     String padMun() => soloDigitos(munCodCtrl.text).padLeft(3, '0');
@@ -1256,6 +1756,23 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
                       const InputDecoration(labelText: 'Teléfono (opcional)'),
                 ),
                 TextField(
+                  controller: otroCtrl,
+                  maxLength: 12,
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                  decoration: InputDecoration(
+                    labelText: 'UPP de otro (opcional)',
+                    helperText: 'Granja externa, con abejas ajenas',
+                    errorText: otroValido() ? null : 'Deben ser 12 dígitos',
+                  ),
+                  onChanged: (_) => setModal(() {}),
+                ),
+                TextField(
+                  controller: otroNomCtrl,
+                  decoration: const InputDecoration(
+                      labelText: 'Dueño de esa UPP (opcional)'),
+                ),
+                TextField(
                   controller: notaCtrl,
                   decoration: const InputDecoration(
                       labelText: 'Localidad / Nota (opcional)'),
@@ -1270,7 +1787,9 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
               child: const Text('Cancelar')),
           FilledButton(
               style: FilledButton.styleFrom(backgroundColor: ambar),
-              onPressed: () => Navigator.pop(ctx, true),
+              onPressed: () {
+                if (otroValido()) Navigator.pop(ctx, true);
+              },
               child: const Text('Guardar')),
         ],
       ),
@@ -1285,6 +1804,8 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
     final nombre = nombreCtrl.text.trim();
     final tel = telCtrl.text.trim();
     final nota = notaCtrl.text.trim();
+    final otro = otroCtrl.text;
+    final otroNom = otroNomCtrl.text.trim();
 
     munCodCtrl.dispose();
     munNomCtrl.dispose();
@@ -1293,6 +1814,8 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
     nombreCtrl.dispose();
     telCtrl.dispose();
     notaCtrl.dispose();
+    otroCtrl.dispose();
+    otroNomCtrl.dispose();
 
     if (ok != true || nombre.isEmpty) return;
 
@@ -1309,6 +1832,8 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
       'nombre': nombre,
       'telefono': tel.isEmpty ? null : tel,
       'nota': nota.isEmpty ? null : nota,
+      'upp_otro': otro.isEmpty ? null : otro,
+      'upp_otro_nombre': otro.isEmpty || otroNom.isEmpty ? null : otroNom,
     };
 
     try {
@@ -1334,6 +1859,7 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
             if (busqueda.isEmpty) return true;
             return '${p['nombre']}'.toLowerCase().contains(busqueda) ||
                 '${p['upp_id']}'.contains(busqueda) ||
+                '${p['upp_otro'] ?? ''}'.contains(busqueda) ||
                 '${p['rasmiel']}'.contains(busqueda) ||
                 '${p['estado_nombre']}'.toLowerCase().contains(busqueda) ||
                 '${p['municipio_nombre'] ?? ''}'
@@ -1486,6 +2012,11 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
                 ],
               ),
             ),
+            if (p['upp_otro'] != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                  'UPP de otro: ${p['upp_otro']} ${p['upp_otro_nombre'] ?? ''}'),
+            ],
             if (tel.isNotEmpty || nota.isNotEmpty) ...[
               const SizedBox(height: 8),
               if (tel.isNotEmpty) Text('Tel: $tel'),
@@ -1505,6 +2036,11 @@ class _ProveedoresScreenState extends State<ProveedoresScreen> {
 // ---------------- UTILIDADES ----------------
 Future<void> mover(
     BuildContext c, String tabla, Map<String, dynamic> it, double signo) async {
+  if (tabla == 'insumos' && it['es_miel'] == true) {
+    // Sin productor ni entrada de origen se perdería la trazabilidad
+    aviso(c, 'La miel se registra en Trazabilidad para conservar su clave');
+    return;
+  }
   final tipo = signo > 0 ? 'Entrada' : 'Salida';
   final cant = await pedirNumero(c, '$tipo · ${it['nombre']}');
   if (cant == null) return;
