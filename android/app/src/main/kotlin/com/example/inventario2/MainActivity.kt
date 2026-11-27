@@ -1,4 +1,4 @@
-package com.example.app_miel
+package com.example.inventario2
 
 import io.flutter.embedding.android.FlutterActivity
 

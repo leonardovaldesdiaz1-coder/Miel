@@ -1,4 +1,4 @@
-# app_miel
+# inventario2
 
 A new Flutter project.
 
