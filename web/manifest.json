@@ -1,6 +1,6 @@
 {
-    "name": "app_miel",
-    "short_name": "app_miel",
+    "name": "inventario2",
+    "short_name": "inventario2",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
